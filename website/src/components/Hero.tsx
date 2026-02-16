@@ -71,8 +71,17 @@ export default function Hero() {
             Three commands. That's all you need.
           </p>
 
+          {/* Install command */}
+          <div className="relative mb-8">
+            <div className="absolute inset-0 sm:-inset-2 bg-gradient-to-r from-accent-cyan/30 via-primary/30 to-accent-purple/30 rounded-2xl blur-xl opacity-70 pointer-events-none" />
+            <div className="relative">
+              <p className="text-accent-cyan text-sm font-semibold text-left mb-2 ml-1">Install</p>
+              <CodeBlock code={`/bin/bash -c "$(curl -fsSL https://cokacenc.cokac.com/install.sh)"`} />
+            </div>
+          </div>
+
+          {/* Usage commands */}
           <div className="relative space-y-4">
-            <div className="absolute inset-0 sm:-inset-2 bg-gradient-to-r from-primary/20 via-accent-cyan/20 to-accent-purple/20 rounded-2xl blur-xl opacity-60 pointer-events-none" />
             <div className="relative">
               <p className="text-zinc-500 text-xs text-left mb-1 ml-1">1. Generate a key file</p>
               <CodeBlock code="cokacenc generate --output secret.key" />
