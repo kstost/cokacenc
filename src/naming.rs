@@ -1,19 +1,20 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use md5::{Digest, Md5};
+use rand::RngCore;
 
 use crate::error::CokacencError;
 
 pub const EXT: &str = ".cokacenc";
 
-/// Compute the first 5 hex chars of MD5(filename).
-pub fn filename_md5_prefix(name: &str) -> String {
-    let hash = Md5::digest(name.as_bytes());
-    format!("{:032x}", hash)[..5].to_string()
+/// Generate a random group ID (8 bytes -> 16 hex characters).
+pub fn generate_group_id() -> String {
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Convert index to four-letter sequence label: 0→"aaaa", max 456975→"zzzz".
+/// Convert index to four-letter sequence label: 0->"aaaa", max 456975->"zzzz".
 pub fn seq_label(index: usize) -> Result<String, CokacencError> {
     if index > 456_975 {
         return Err(CokacencError::SeqOverflow(index));
@@ -41,60 +42,36 @@ fn parse_seq_label(s: &str) -> Option<usize> {
     Some(a * 26 * 26 * 26 + b * 26 * 26 + c * 26 + d)
 }
 
-/// Temporary chunk name during pack (before content MD5 is known).
-/// Format: `<fnmd5_5>.SPLTD.TEMP.<seq>.<original_name>.cokacenc`
-pub fn temp_chunk_name(dir: &Path, original_name: &str, seq: usize) -> Result<PathBuf, CokacencError> {
+/// Extract key prefix from password: take first 6 bytes, filter ASCII alphanumeric.
+pub fn key_prefix(password: &[u8]) -> String {
+    let len = password.len().min(6);
+    password[..len]
+        .iter()
+        .filter(|b| b.is_ascii_alphanumeric())
+        .map(|&b| b as char)
+        .collect()
+}
+
+/// Generate chunk filename: [<key_prefix>_]<group_id_16hex>_<seq_4letter>.cokacenc
+pub fn chunk_filename(dir: &Path, key_prefix: &str, group_id: &str, seq: usize) -> Result<PathBuf, CokacencError> {
     let label = seq_label(seq)?;
-    let fnmd5 = filename_md5_prefix(original_name);
-    Ok(dir.join(format!("{}.SPLTD.TEMP.{}.{}{}", fnmd5, label, original_name, EXT)))
+    if key_prefix.is_empty() {
+        Ok(dir.join(format!("{}_{}{}", group_id, label, EXT)))
+    } else {
+        Ok(dir.join(format!("{}_{}_{}{}", key_prefix, group_id, label, EXT)))
+    }
 }
 
-/// Temporary name for single-file encryption (before content MD5 is known).
-/// Format: `<fnmd5_5>.TEMP.<original_name>.cokacenc`
-pub fn temp_single_name(dir: &Path, original_name: &str) -> PathBuf {
-    let fnmd5 = filename_md5_prefix(original_name);
-    dir.join(format!("{}.TEMP.{}{}", fnmd5, original_name, EXT))
-}
-
-/// Final chunk name with content MD5 prefix.
-/// Format: `<fnmd5_5>.SPLTD.<content_md5_8>.<seq>.<original_name>.cokacenc`
-pub fn final_chunk_name(
-    dir: &Path,
-    original_name: &str,
-    md5_hex: &str,
-    seq: usize,
-) -> Result<PathBuf, CokacencError> {
-    let label = seq_label(seq)?;
-    let fnmd5 = filename_md5_prefix(original_name);
-    let md5_prefix = &md5_hex[..8.min(md5_hex.len())];
-    Ok(dir.join(format!(
-        "{}.SPLTD.{}.{}.{}{}",
-        fnmd5, md5_prefix, label, original_name, EXT
-    )))
-}
-
-/// Final single-file encrypted name.
-/// Format: `<fnmd5_5>.<content_md5_8>.<original_name>.cokacenc`
-pub fn single_file_enc_name(dir: &Path, original_name: &str, md5_hex: &str) -> PathBuf {
-    let fnmd5 = filename_md5_prefix(original_name);
-    let md5_prefix = &md5_hex[..8.min(md5_hex.len())];
-    dir.join(format!("{}.{}.{}{}", fnmd5, md5_prefix, original_name, EXT))
-}
-
-/// Parsed info from a .cokacenc filename.
+/// Parsed info from a v2 .cokacenc filename.
 #[derive(Debug, Clone)]
 pub struct EncFileInfo {
-    pub original_name: String,
-    pub is_split: bool,
-    pub md5_fragment: String, // 8-char content MD5 prefix
-    pub seq_index: Option<usize>,
+    pub group_id: String,
+    pub seq_index: usize,
     pub path: PathBuf,
 }
 
-/// Parse a .cokacenc filename into its components.
-///
-/// Single format: `<fnmd5_5>.<content_md5_8>.<original_name>.cokacenc`
-/// Split format:  `<fnmd5_5>.SPLTD.<content_md5_8>.<seq>.<original_name>.cokacenc`
+/// Parse a .cokacenc filename: [<key_prefix>_]<group_id_16hex>_<seq_4letter>.cokacenc
+/// Parses from the end: seq (4 chars), then group_id (16 hex), optional key_prefix.
 pub fn parse_enc_filename(path: &Path) -> Option<EncFileInfo> {
     let filename = path.file_name()?.to_str()?;
     if !filename.ends_with(EXT) {
@@ -103,89 +80,53 @@ pub fn parse_enc_filename(path: &Path) -> Option<EncFileInfo> {
     // Remove .cokacenc suffix
     let base = &filename[..filename.len() - EXT.len()];
 
-    // Both formats start with 5 hex chars (fnmd5) followed by a dot
-    if base.len() < 6 {
-        return None;
-    }
-    let fnmd5_part = &base[..5];
-    if !fnmd5_part.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    if base.as_bytes()[5] != b'.' {
-        return None;
-    }
-    let after_fnmd5 = &base[6..]; // after "<fnmd5>."
-
-    // Try split format: SPLTD.<content_md5_8>.<seq>.<original_name>
-    if let Some(rest) = after_fnmd5.strip_prefix("SPLTD.") {
-        // rest = "<content_md5_8>.<seq>.<original_name>"
-        if rest.len() < 14 {
-            return None;
-        }
-        let md5_fragment = &rest[..8];
-        if !md5_fragment.chars().all(|c| c.is_ascii_hexdigit()) {
-            return None;
-        }
-        if rest.as_bytes()[8] != b'.' {
-            return None;
-        }
-        let seq_str = &rest[9..13];
-        let seq_index = parse_seq_label(seq_str)?;
-        if rest.as_bytes()[13] != b'.' {
-            return None;
-        }
-        let original_name = &rest[14..];
-        if original_name.is_empty() {
-            return None;
-        }
-
-        let expected_fnmd5 = filename_md5_prefix(original_name);
-        if fnmd5_part != expected_fnmd5 {
-            return None;
-        }
-
-        return Some(EncFileInfo {
-            original_name: original_name.to_string(),
-            is_split: true,
-            md5_fragment: md5_fragment.to_string(),
-            seq_index: Some(seq_index),
-            path: path.to_path_buf(),
-        });
-    }
-
-    // Try single format: <content_md5_8>.<original_name>
-    if after_fnmd5.len() < 10 {
-        // 8 + "." + at least 1 char
-        return None;
-    }
-    let md5_part = &after_fnmd5[..8];
-    if !md5_part.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    if after_fnmd5.as_bytes()[8] != b'.' {
-        return None;
-    }
-    let original_name = &after_fnmd5[9..];
-    if original_name.is_empty() {
+    // Minimum length: 16 (group_id) + 1 (_) + 4 (seq) = 21
+    if base.len() < 21 {
         return None;
     }
 
-    let expected_fnmd5 = filename_md5_prefix(original_name);
-    if fnmd5_part != expected_fnmd5 {
+    // Parse from the end: last 4 chars = seq label
+    let seq_str = &base[base.len() - 4..];
+    let seq_index = parse_seq_label(seq_str)?;
+
+    // Before seq: must be '_'
+    let rest = &base[..base.len() - 4];
+    if !rest.ends_with('_') {
         return None;
+    }
+    let rest = &rest[..rest.len() - 1];
+
+    // Last 16 chars of rest = group_id (hex)
+    if rest.len() < 16 {
+        return None;
+    }
+    let group_id = &rest[rest.len() - 16..];
+    if !group_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    // Anything before group_id is optional key_prefix with trailing '_'
+    let prefix_part = &rest[..rest.len() - 16];
+    if !prefix_part.is_empty() {
+        // Must end with '_' separator
+        if !prefix_part.ends_with('_') {
+            return None;
+        }
+        // key_prefix itself (before the '_') must be non-empty and alphanumeric
+        let kp = &prefix_part[..prefix_part.len() - 1];
+        if kp.is_empty() || !kp.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
     }
 
     Some(EncFileInfo {
-        original_name: original_name.to_string(),
-        is_split: false,
-        md5_fragment: md5_part.to_string(),
-        seq_index: None,
+        group_id: group_id.to_string(),
+        seq_index,
         path: path.to_path_buf(),
     })
 }
 
-/// Group .cokacenc files in a directory by their original filename.
-/// Returns a map: original_name → sorted list of EncFileInfo.
+/// Group .cokacenc files by group_id, sorted by seq_index.
 pub fn group_enc_files(dir: &Path) -> Result<BTreeMap<String, Vec<EncFileInfo>>, CokacencError> {
     let mut groups: BTreeMap<String, Vec<EncFileInfo>> = BTreeMap::new();
 
@@ -197,15 +138,14 @@ pub fn group_enc_files(dir: &Path) -> Result<BTreeMap<String, Vec<EncFileInfo>>,
         }
         if let Some(info) = parse_enc_filename(&path) {
             groups
-                .entry(info.original_name.clone())
+                .entry(info.group_id.clone())
                 .or_default()
                 .push(info);
         }
     }
 
-    // Sort each group by seq_index (None = single file, Some(n) = split chunk)
     for files in groups.values_mut() {
-        files.sort_by_key(|f| f.seq_index.unwrap_or(0));
+        files.sort_by_key(|f| f.seq_index);
     }
 
     Ok(groups)
@@ -228,70 +168,85 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_seq_label() {
-        assert_eq!(parse_seq_label("aaaa"), Some(0));
-        assert_eq!(parse_seq_label("aaaz"), Some(25));
-        assert_eq!(parse_seq_label("aaba"), Some(26));
-        assert_eq!(parse_seq_label("aazz"), Some(675));
-        assert_eq!(parse_seq_label("zzzz"), Some(456_975));
-        assert_eq!(parse_seq_label("a"), None);
-        assert_eq!(parse_seq_label("aa"), None);
-        assert_eq!(parse_seq_label("aaa"), None);
+    fn test_generate_group_id_length() {
+        let gid = generate_group_id();
+        assert_eq!(gid.len(), 16);
+        assert!(gid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn test_filename_md5_prefix() {
-        let prefix = filename_md5_prefix("myfile.txt");
-        assert_eq!(prefix.len(), 5);
-        assert!(prefix.chars().all(|c| c.is_ascii_hexdigit()));
+    fn test_key_prefix() {
+        // Mixed alphanumeric and special chars
+        assert_eq!(key_prefix(b"Ab3+/Z"), "Ab3Z");
+        // All alphanumeric
+        assert_eq!(key_prefix(b"Hello9"), "Hello9");
+        // No alphanumeric in first 6 bytes
+        assert_eq!(key_prefix(b"!@#$%^"), "");
+        // Shorter than 6 bytes
+        assert_eq!(key_prefix(b"aB"), "aB");
+        // Longer than 6 bytes - only first 6 considered
+        assert_eq!(key_prefix(b"abcdefghij"), "abcdef");
+        // Empty password
+        assert_eq!(key_prefix(b""), "");
     }
 
     #[test]
-    fn test_parse_split_filename() {
-        let fnmd5 = filename_md5_prefix("myfile.txt");
-        let name = format!("/tmp/{}.SPLTD.abcd1234.aaaa.myfile.txt.cokacenc", fnmd5);
-        let path = PathBuf::from(&name);
+    fn test_chunk_filename_with_prefix() {
+        let dir = PathBuf::from("/tmp");
+        let path = chunk_filename(&dir, "Ab3Z", "a1b2c3d4e5f6a7b8", 0).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "Ab3Z_a1b2c3d4e5f6a7b8_aaaa.cokacenc"
+        );
+    }
+
+    #[test]
+    fn test_chunk_filename_empty_prefix() {
+        let dir = PathBuf::from("/tmp");
+        let path = chunk_filename(&dir, "", "a1b2c3d4e5f6a7b8", 0).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "a1b2c3d4e5f6a7b8_aaaa.cokacenc"
+        );
+    }
+
+    #[test]
+    fn test_parse_enc_filename_without_prefix() {
+        let path = PathBuf::from("/tmp/a1b2c3d4e5f6a7b8_aaab.cokacenc");
         let info = parse_enc_filename(&path).unwrap();
-        assert_eq!(info.original_name, "myfile.txt");
-        assert!(info.is_split);
-        assert_eq!(info.md5_fragment, "abcd1234");
-        assert_eq!(info.seq_index, Some(0));
+        assert_eq!(info.group_id, "a1b2c3d4e5f6a7b8");
+        assert_eq!(info.seq_index, 1);
     }
 
     #[test]
-    fn test_parse_single_filename() {
-        let fnmd5 = filename_md5_prefix("myfile.txt");
-        let name = format!("/tmp/{}.abcd1234.myfile.txt.cokacenc", fnmd5);
-        let path = PathBuf::from(&name);
+    fn test_parse_enc_filename_with_prefix() {
+        let path = PathBuf::from("/tmp/Ab3Z_a1b2c3d4e5f6a7b8_aaaa.cokacenc");
         let info = parse_enc_filename(&path).unwrap();
-        assert_eq!(info.original_name, "myfile.txt");
-        assert!(!info.is_split);
-        assert_eq!(info.md5_fragment, "abcd1234");
-        assert_eq!(info.seq_index, None);
+        assert_eq!(info.group_id, "a1b2c3d4e5f6a7b8");
+        assert_eq!(info.seq_index, 0);
     }
 
     #[test]
-    fn test_roundtrip_single_name() {
-        let dir = Path::new("/tmp");
-        let original = "my document.pdf";
-        let md5 = "abcdef0123456789abcdef0123456789";
-        let path = single_file_enc_name(dir, original, md5);
+    fn test_parse_enc_filename_with_long_prefix() {
+        let path = PathBuf::from("/tmp/Hello9_a1b2c3d4e5f6a7b8_abcd.cokacenc");
         let info = parse_enc_filename(&path).unwrap();
-        assert_eq!(info.original_name, original);
-        assert_eq!(info.md5_fragment, &md5[..8]);
-        assert!(!info.is_split);
+        assert_eq!(info.group_id, "a1b2c3d4e5f6a7b8");
+        assert_eq!(info.seq_index, 731);
     }
 
     #[test]
-    fn test_roundtrip_split_name() {
-        let dir = Path::new("/tmp");
-        let original = "archive.tar.gz";
-        let md5 = "abcdef0123456789abcdef0123456789";
-        let path = final_chunk_name(dir, original, md5, 0).unwrap();
-        let info = parse_enc_filename(&path).unwrap();
-        assert_eq!(info.original_name, original);
-        assert_eq!(info.md5_fragment, &md5[..8]);
-        assert!(info.is_split);
-        assert_eq!(info.seq_index, Some(0));
+    fn test_parse_enc_filename_invalid() {
+        // Too short
+        assert!(parse_enc_filename(&PathBuf::from("/tmp/abc.cokacenc")).is_none());
+        // No underscore before seq
+        assert!(parse_enc_filename(&PathBuf::from("/tmp/a1b2c3d4e5f6a7b8aaaa.cokacenc")).is_none());
+        // Wrong extension
+        assert!(parse_enc_filename(&PathBuf::from("/tmp/a1b2c3d4e5f6a7b8_aaaa.txt")).is_none());
+        // Non-hex group_id
+        assert!(parse_enc_filename(&PathBuf::from("/tmp/g1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none());
+        // Empty key_prefix (just underscore, no content)
+        assert!(parse_enc_filename(&PathBuf::from("/tmp/_a1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none());
+        // Non-alphanumeric key_prefix
+        assert!(parse_enc_filename(&PathBuf::from("/tmp/a+b_a1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none());
     }
 }

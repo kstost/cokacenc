@@ -9,8 +9,8 @@ use sha2::Sha512;
 use crate::error::CokacencError;
 
 pub const MAGIC: &[u8; 8] = b"COKACENC";
-pub const VERSION: u32 = 1;
-pub const HEADER_SIZE: usize = 8 + 4 + 16 + 16; // 44 bytes
+pub const VERSION: u32 = 2;
+const MAX_FILENAME_LEN: usize = 4096;
 const AES_BLOCK: usize = 16;
 const KEY_LEN: usize = 32;
 const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -50,21 +50,32 @@ pub fn generate_iv() -> [u8; 16] {
     iv
 }
 
-/// Write the 44-byte chunk header.
+/// Write the chunk header: magic + version + salt + iv + filename.
 pub fn write_header(
     w: &mut dyn Write,
     salt: &[u8; 16],
     iv: &[u8; 16],
+    filename: &str,
 ) -> Result<(), CokacencError> {
+    let name_bytes = filename.as_bytes();
+    if name_bytes.len() > MAX_FILENAME_LEN {
+        return Err(CokacencError::Other(format!(
+            "Filename too long: {} bytes (max {})",
+            name_bytes.len(),
+            MAX_FILENAME_LEN,
+        )));
+    }
     w.write_all(MAGIC)?;
     w.write_all(&VERSION.to_le_bytes())?;
     w.write_all(salt)?;
     w.write_all(iv)?;
+    w.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
+    w.write_all(name_bytes)?;
     Ok(())
 }
 
-/// Read and validate the 44-byte chunk header. Returns (salt, iv).
-pub fn read_header(r: &mut dyn Read) -> Result<([u8; 16], [u8; 16]), CokacencError> {
+/// Read and validate the chunk header. Returns (salt, iv, filename).
+pub fn read_header(r: &mut dyn Read) -> Result<([u8; 16], [u8; 16], String), CokacencError> {
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -84,7 +95,22 @@ pub fn read_header(r: &mut dyn Read) -> Result<([u8; 16], [u8; 16]), CokacencErr
     let mut iv = [0u8; 16];
     r.read_exact(&mut iv)?;
 
-    Ok((salt, iv))
+    let mut name_len_bytes = [0u8; 2];
+    r.read_exact(&mut name_len_bytes)?;
+    let name_len = u16::from_le_bytes(name_len_bytes) as usize;
+    if name_len > MAX_FILENAME_LEN {
+        return Err(CokacencError::Other(format!(
+            "Filename length in header too long: {} bytes (max {})",
+            name_len,
+            MAX_FILENAME_LEN,
+        )));
+    }
+    let mut name_buf = vec![0u8; name_len];
+    r.read_exact(&mut name_buf)?;
+    let filename = String::from_utf8(name_buf)
+        .map_err(|e| CokacencError::Other(format!("Invalid filename UTF-8: {}", e)))?;
+
+    Ok((salt, iv, filename))
 }
 
 /// Streaming chunk encryptor that processes data block-by-block.

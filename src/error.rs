@@ -23,6 +23,9 @@ pub enum CokacencError {
     #[error("Missing chunk in sequence: expected seq {expected} but not found")]
     MissingChunk { expected: String },
 
+    #[error("Metadata parse error: {0}")]
+    MetadataParse(String),
+
     #[error("Key file is empty")]
     EmptyKeyFile,
 

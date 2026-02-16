@@ -17,38 +17,39 @@ use rand::RngCore;
     version,
     about = "AES-256-CBC file encryption + split tool",
     long_about = "\
-AES-256-CBC file encryption + split tool
+AES-256-CBC file encryption + split tool (v2 format)
 
 cokacenc encrypts files in a directory using AES-256-CBC and
 optionally splits them into chunks of a specified size.
-All operations are processed in a single-pass streaming fashion.
+Uses 2-pass processing with metadata embedded in each chunk.
 
 ━━━ How It Works ━━━
 
-  pack   : Read file → MD5 hash + AES-256-CBC encrypt → chunk split (→ delete original with --delete)
-  unpack : Group .cokacenc files → decrypt in order → merge into single file → MD5 verify (→ delete .cokacenc with --delete)
-
-  All operations are single-pass streaming for efficient large file handling.
-  (1 read + 1 write, no temporary files)
+  pack   : Pass 1: compute MD5 + gather metadata
+           Pass 2: encrypt with metadata embedded in each chunk (→ delete original with --delete)
+  unpack : Group .cokacenc files by group ID → decrypt in order → extract metadata
+           → merge into single file → MD5 verify → restore permissions/mtime (→ delete .cokacenc with --delete)
 
 ━━━ Encryption Details ━━━
 
   Algorithm       : AES-256-CBC (PKCS7 padding)
   Key derivation  : PBKDF2-HMAC-SHA512, 100,000 iterations
   Salt/IV         : Independent 16-byte random per chunk
-  Integrity check : MD5 hash (embedded in filename)
+  Integrity check : Full MD5 hash (embedded in chunk metadata)
 
+  → Each chunk contains full file metadata (name, size, MD5, permissions, mtime).
   → Each chunk can be decrypted independently.
 
 ━━━ Chunk File Format (44-byte header + ciphertext) ━━━
 
-  [8B magic \"COKACENC\"][4B version LE][16B PBKDF2 salt][16B AES IV][...ciphertext...]
+  Header    : [8B magic \"COKACENC\"][4B version LE (=2)][16B PBKDF2 salt][16B AES IV]
+  Plaintext : [4B meta_len LE u32][metadata JSON][file data...]
 
-━━━ Output Filename Convention ━━━
+━━━ Output Filename Convention (v2) ━━━
 
-  No split  : <fnMD5 first 5>.<contentMD5 first 8>.<original name>.cokacenc
-  Split     : <fnMD5 first 5>.SPLTD.<contentMD5 first 8>.<seq>.<original name>.cokacenc
-              fnMD5 = MD5 of original filename, seq = aaaa, aaab, ... zzzz (max 456,976)
+  <group_id 16hex>_<seq 4letter>.cokacenc
+  group_id = 8 random bytes (16 hex chars), seq = aaaa, aaab, ... zzzz (max 456,976)
+  Original filename is stored inside encrypted metadata, not in the filename.
 
 ━━━ Key File ━━━
 
@@ -66,9 +67,6 @@ All operations are processed in a single-pass streaming fashion.
   # Encrypt with 500MB chunk split
   cokacenc pack --dir ./data --key secret.key --size 500
 
-  # Encrypt without splitting
-  cokacenc pack --dir ./data --key secret.key --size 0
-
   # Decrypt encrypted files
   cokacenc unpack --dir ./data --key secret.key
 
@@ -77,7 +75,8 @@ All operations are processed in a single-pass streaming fashion.
   - With --delete, original files are removed after successful pack.
   - With --delete, .cokacenc files are removed after successful unpack.
   - Hidden files (starting with .) and .cokacenc files are excluded from pack.
-  - The same key file must be used for both pack and unpack."
+  - The same key file must be used for both pack and unpack.
+  - v2 format is NOT compatible with v1 encrypted files."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -86,21 +85,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Encrypt and split files in a directory
+    /// Encrypt and split files in a directory (v2 format)
     ///
     /// Encrypts all regular files in the specified directory using AES-256-CBC.
     /// Files exceeding --size are automatically split into multiple chunks.
+    /// Each chunk embeds full metadata (filename, MD5, size, permissions, mtime).
     ///
-    /// Processing flow:
-    ///   1. Read file in 64KB buffers while computing MD5 hash + AES-256-CBC encryption
-    ///   2. When ciphertext reaches --size, finalize current chunk and start a new one
-    ///      (each new chunk gets an independent salt/IV)
-    ///   3. After reading completes, rename temp files to final names using MD5 hash
-    ///   4. With --delete, remove the original file
+    /// Processing flow (2-pass):
+    ///   1. Pass 1: Read file to compute MD5 hash + gather metadata (size, mtime, permissions)
+    ///   2. Pass 2: Encrypt with metadata embedded at the start of each chunk's plaintext
+    ///      (each chunk gets an independent salt/IV)
+    ///   3. With --delete, remove the original file
     ///
     /// Output filenames:
-    ///   No split  : <fnMD5 first 5>.<contentMD5 first 8>.<original name>.cokacenc
-    ///   Split     : <fnMD5 first 5>.SPLTD.<contentMD5 first 8>.<seq>.<original name>.cokacenc  (seq: aaaa~zzzz)
+    ///   <group_id 16hex>_<seq 4letter>.cokacenc  (seq: aaaa~zzzz)
+    ///   Original filename is stored inside encrypted metadata.
     ///
     /// Excluded from processing:
     ///   - Hidden files (starting with .)
@@ -109,7 +108,6 @@ enum Commands {
     /// Examples:
     ///   cokacenc pack --dir ./mydir --key secret.key
     ///   cokacenc pack --dir ./mydir --key secret.key --size 500
-    ///   cokacenc pack --dir ./mydir --key secret.key --size 0
     Pack {
         /// Directory path containing files to encrypt
         ///
@@ -130,7 +128,6 @@ enum Commands {
         /// Maximum chunk size in MB
         ///
         /// If the plaintext size exceeds this value, the file is split into multiple chunks.
-        /// Set to 0 to disable splitting and create a single .cokacenc file.
         /// Default is 1800MB (approximately 1.76GB).
         #[arg(long, default_value = "1800", value_name = "MB")]
         size: u64,
@@ -176,19 +173,21 @@ enum Commands {
         force: bool,
     },
 
-    /// Decrypt and merge .cokacenc files in a directory
+    /// Decrypt and merge .cokacenc files in a directory (v2 format)
     ///
     /// Decrypts .cokacenc files in the specified directory and restores the original files.
+    /// Original filename, permissions, and mtime are restored from embedded metadata.
     ///
     /// Processing flow:
-    ///   1. Group .cokacenc files in the directory by original filename
+    ///   1. Group .cokacenc files by group ID (from filename)
     ///   2. Decrypt each group's chunks in sequence order (aaaa, aaab, ...)
-    ///   3. Merge decrypted data into a single file while computing MD5 hash
-    ///   4. Verify integrity by comparing with the MD5 embedded in the filename
-    ///   5. With --delete, remove the .cokacenc files
+    ///   3. Extract metadata from each chunk, merge file data while computing MD5 hash
+    ///   4. Verify integrity by comparing with the full MD5 from metadata
+    ///   5. Restore original filename, permissions, and mtime
+    ///   6. With --delete, remove the .cokacenc files
     ///
     /// MD5 verification:
-    ///   - Compared against the 8-character MD5 prefix in the filename
+    ///   - Full 32-character MD5 comparison against metadata
     ///   - On mismatch, the decrypted file is deleted and an error is raised
     ///
     /// Examples:
