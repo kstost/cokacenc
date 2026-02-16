@@ -1,0 +1,21 @@
+[package]
+name = "cokacenc"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cokacenc"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+cipher = { version = "0.4", features = ["block-padding"] }
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+rand = "0.8"
+anyhow = "1"
+thiserror = "1"

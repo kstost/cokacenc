@@ -1,0 +1,41 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build output
+/dist/
+
+# Test artifacts
+/testdummy/
+
+# Builder tools (downloaded automatically)
+/builder/tools/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Website build output
+website/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
