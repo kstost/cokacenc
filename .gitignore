@@ -4,7 +4,7 @@
 Cargo.lock
 
 # Build output
-/dist/
+# /dist/
 
 # Test artifacts
 /testdummy/
