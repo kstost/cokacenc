@@ -223,7 +223,7 @@ fn unpack_file_group(
             println!("  -> {}", original_name);
         } else {
             // Cross-check metadata consistency across chunks
-            if meta.filename != original_name || meta.file_md5 != expected_md5 {
+            if meta.filename != original_name || (!expected_md5.is_empty() && meta.file_md5 != expected_md5) {
                 let _ = fs::remove_file(&temp_path);
                 return Err(CokacencError::MetadataParse(
                     "Inconsistent metadata across chunks".to_string(),
@@ -235,9 +235,9 @@ fn unpack_file_group(
     file_writer.flush()?;
     drop(file_writer);
 
-    // Verify MD5
+    // Verify MD5 (skip if MD5 was not computed during encryption)
     let md5_hex = format!("{:032x}", md5_hasher.finalize());
-    if md5_hex != expected_md5 {
+    if !expected_md5.is_empty() && md5_hex != expected_md5 {
         let _ = fs::remove_file(&temp_path);
         return Err(CokacencError::Md5Mismatch {
             expected: expected_md5,
@@ -245,7 +245,11 @@ fn unpack_file_group(
         });
     }
 
-    println!("  MD5 verified: {}", md5_hex);
+    if expected_md5.is_empty() {
+        println!("  MD5 verification: skipped");
+    } else {
+        println!("  MD5 verified: {}", md5_hex);
+    }
 
     // Verify file size
     let actual_size = fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);

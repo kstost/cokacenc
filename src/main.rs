@@ -25,17 +25,17 @@ Uses 2-pass processing with metadata embedded in each chunk.
 
 ━━━ How It Works ━━━
 
-  pack   : Pass 1: compute MD5 + gather metadata
+  pack   : Pass 1: gather metadata (+ compute MD5 with --md5)
            Pass 2: encrypt with metadata embedded in each chunk (→ delete original with --delete)
   unpack : Group .cokacenc files by group ID → decrypt in order → extract metadata
-           → merge into single file → MD5 verify → restore permissions/mtime (→ delete .cokacenc with --delete)
+           → merge into single file → MD5 verify (if available) → restore permissions/mtime (→ delete .cokacenc with --delete)
 
 ━━━ Encryption Details ━━━
 
   Algorithm       : AES-256-CBC (PKCS7 padding)
   Key derivation  : PBKDF2-HMAC-SHA512, 100,000 iterations
   Salt/IV         : Independent 16-byte random per chunk
-  Integrity check : Full MD5 hash (embedded in chunk metadata)
+  Integrity check : Full MD5 hash (embedded in chunk metadata, optional with --md5)
 
   → Each chunk contains full file metadata (name, size, MD5, permissions, mtime).
   → Each chunk can be decrypted independently.
@@ -92,7 +92,7 @@ enum Commands {
     /// Each chunk embeds full metadata (filename, MD5, size, permissions, mtime).
     ///
     /// Processing flow (2-pass):
-    ///   1. Pass 1: Read file to compute MD5 hash + gather metadata (size, mtime, permissions)
+    ///   1. Pass 1: Gather metadata (size, mtime, permissions) + compute MD5 hash (with --md5)
     ///   2. Pass 2: Encrypt with metadata embedded at the start of each chunk's plaintext
     ///      (each chunk gets an independent salt/IV)
     ///   3. With --delete, remove the original file
@@ -138,6 +138,14 @@ enum Commands {
         /// Without this option, original files are kept as-is.
         #[arg(long)]
         delete: bool,
+
+        /// Compute and embed MD5 hash for integrity verification
+        ///
+        /// When specified, an MD5 hash of the original file is computed (first pass)
+        /// and embedded in chunk metadata. During unpack, the hash is verified.
+        /// Without this option, MD5 computation is skipped for faster encryption.
+        #[arg(long)]
+        md5: bool,
     },
 
     /// Generate a random key file
@@ -182,13 +190,14 @@ enum Commands {
     ///   1. Group .cokacenc files by group ID (from filename)
     ///   2. Decrypt each group's chunks in sequence order (aaaa, aaab, ...)
     ///   3. Extract metadata from each chunk, merge file data while computing MD5 hash
-    ///   4. Verify integrity by comparing with the full MD5 from metadata
+    ///   4. Verify integrity by comparing with the full MD5 from metadata (skipped if MD5 was not computed during pack)
     ///   5. Restore original filename, permissions, and mtime
     ///   6. With --delete, remove the .cokacenc files
     ///
     /// MD5 verification:
-    ///   - Full 32-character MD5 comparison against metadata
+    ///   - Full 32-character MD5 comparison against metadata (if MD5 was computed during pack)
     ///   - On mismatch, the decrypted file is deleted and an error is raised
+    ///   - If pack was done without --md5, verification is automatically skipped
     ///
     /// Examples:
     ///   cokacenc unpack --dir ./mydir --key secret.key
@@ -225,7 +234,8 @@ fn main() {
             key,
             size,
             delete,
-        } => pack::pack_directory(&dir, &key, size, delete),
+            md5,
+        } => pack::pack_directory(&dir, &key, size, delete, md5),
         Commands::Generate {
             output,
             length,

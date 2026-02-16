@@ -50,7 +50,7 @@ struct FileInfo {
     permissions: u32,
 }
 
-fn gather_file_info(path: &Path) -> Result<FileInfo, CokacencError> {
+fn gather_file_info(path: &Path, use_md5: bool) -> Result<FileInfo, CokacencError> {
     let metadata = fs::metadata(path)?;
     let size = metadata.len();
 
@@ -68,17 +68,21 @@ fn gather_file_info(path: &Path) -> Result<FileInfo, CokacencError> {
     #[cfg(not(unix))]
     let permissions = 0u32;
 
-    // Compute MD5 (first pass)
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Md5::new();
-    let mut buf = [0u8; READ_BUF_SIZE];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 { break; }
-        hasher.update(&buf[..n]);
-    }
-    let md5 = format!("{:032x}", hasher.finalize());
+    let md5 = if use_md5 {
+        // Compute MD5 (first pass)
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let mut hasher = Md5::new();
+        let mut buf = [0u8; READ_BUF_SIZE];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 { break; }
+            hasher.update(&buf[..n]);
+        }
+        format!("{:032x}", hasher.finalize())
+    } else {
+        String::new()
+    };
 
     Ok(FileInfo { size, md5, modified, permissions })
 }
@@ -93,6 +97,7 @@ pub fn pack_directory(
     key_path: &Path,
     split_size_mb: u64,
     delete: bool,
+    use_md5: bool,
 ) -> Result<(), CokacencError> {
     let password = load_key_file(key_path)?;
     let split_size = if split_size_mb == 0 {
@@ -125,7 +130,7 @@ pub fn pack_directory(
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         println!("Packing: {}", name);
-        pack_file(&path, &name, dir, &password, split_size, delete)?;
+        pack_file(&path, &name, dir, &password, split_size, delete, use_md5)?;
         println!("  Done: {}", name);
     }
 
@@ -142,11 +147,17 @@ fn pack_file(
     password: &[u8],
     split_size: u64,
     delete: bool,
+    use_md5: bool,
 ) -> Result<(), CokacencError> {
     // ── Pass 1: gather info ──
-    let info = gather_file_info(file_path)?;
+    let info = gather_file_info(file_path, use_md5)?;
 
-    let group_id = naming::generate_group_id();
+    let group_id = loop {
+        let id = naming::generate_group_id();
+        if !naming::group_id_exists(out_dir, &id) {
+            break id;
+        }
+    };
     let kp = naming::key_prefix(password);
     let total_chunks = if info.size == 0 {
         1
@@ -232,13 +243,22 @@ fn pack_file(
         return result;
     }
 
-    println!(
-        "  -> group {}, {} chunk(s), MD5: {} ({})",
-        group_id,
-        total_chunks,
-        &info.md5[..8],
-        format_size(info.size),
-    );
+    if info.md5.is_empty() {
+        println!(
+            "  -> group {}, {} chunk(s), MD5: off ({})",
+            group_id,
+            total_chunks,
+            format_size(info.size),
+        );
+    } else {
+        println!(
+            "  -> group {}, {} chunk(s), MD5: {} ({})",
+            group_id,
+            total_chunks,
+            &info.md5[..8],
+            format_size(info.size),
+        );
+    }
 
     // Delete original file if requested
     if delete {
